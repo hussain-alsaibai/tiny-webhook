@@ -167,5 +167,116 @@ class TestRequestContext:
         assert ctx.headers.get("X-Custom") == "val"
 
 
+class TestResponseFraming:
+    """Wire-level tests: read the bytes the server actually sends.
+
+    The existing suite calls handlers and asserts on the returned dict, so it
+    never observes headers. That is how `_respond()` shipped without a
+    Content-Length for its whole life, and how a malformed Content-Length
+    could produce no response at all without a single test failing.
+    """
+
+    @staticmethod
+    def _serve(app):
+        import threading
+        from http.server import HTTPServer
+        import tiny_webhook
+
+        class Handler(tiny_webhook._RequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(app, *args, **kwargs)
+
+        httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        return httpd, thread
+
+    @staticmethod
+    def _raw(port, method, path, body=b"", headers=""):
+        import socket
+
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            sock.sendall(
+                f"{method} {path} HTTP/1.1\r\nHost: localhost\r\n"
+                f"{headers}Connection: close\r\n\r\n".encode() + body
+            )
+            data = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            sock.close()
+        head, _, payload = data.partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        hdrs = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                hdrs[k.strip().lower()] = v.strip()
+        return lines[0], hdrs, payload
+
+    @pytest.fixture()
+    def server(self):
+        from tiny_webhook import WebhookApp
+
+        app = WebhookApp()
+
+        @app.on("hook", "/hook")
+        async def handler(payload, ctx):
+            return {"ok": True}
+
+        httpd, thread = self._serve(app)
+        try:
+            yield httpd.server_address[1]
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
+    def test_successful_post_declares_its_length(self, server):
+        status, headers, body = self._raw(
+            server,
+            "POST",
+            "/hook",
+            b"{}",
+            "Content-Length: 2\r\nContent-Type: application/json\r\n",
+        )
+        assert "200" in status
+        assert headers.get("content-length") == str(len(body))
+        assert body == b'{"ok": true}'
+
+    def test_404_declares_its_length(self, server):
+        status, headers, body = self._raw(server, "GET", "/nope")
+        assert "404" in status
+        assert headers.get("content-length") == str(len(body))
+
+    def test_health_declares_its_length(self, server):
+        status, headers, body = self._raw(server, "GET", "/health")
+        assert "200" in status
+        assert headers.get("content-length") == str(len(body))
+
+    def test_malformed_content_length_gets_a_400_not_silence(self, server):
+        """This used to return nothing: int('abc') raised outside the try."""
+        status, headers, body = self._raw(
+            server, "POST", "/hook", b"{}", "Content-Length: abc\r\n"
+        )
+        assert "400" in status
+        assert headers.get("content-length") == str(len(body))
+        assert b"Content-Length" in body
+
+    def test_negative_content_length_gets_a_400(self, server):
+        status, _, _ = self._raw(
+            server, "POST", "/hook", b"{}", "Content-Length: -5\r\n"
+        )
+        assert "400" in status
+
+    def test_missing_content_length_is_still_treated_as_empty(self, server):
+        status, _, _ = self._raw(server, "POST", "/hook", b"{}", "")
+        assert "200" in status
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

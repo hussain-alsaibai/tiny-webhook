@@ -459,7 +459,21 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._respond(500, {"error": "No app"})
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
+        # A header the client controls must not be able to kill the response.
+        # `int("abc")` used to raise here, *before* the try block below, so the
+        # exception escaped do_POST; BaseHTTPRequestHandler logged it and
+        # returned nothing at all. The sender then waited for a reply that
+        # never came -- a webhook provider sees a timeout, retries with the
+        # same malformed body, and the endpoint times out forever.
+        raw_length = self.headers.get("Content-Length")
+        try:
+            content_length = int(raw_length) if raw_length is not None else 0
+        except (TypeError, ValueError):
+            self._respond(400, {"error": "invalid Content-Length header"})
+            return
+        if content_length < 0:
+            self._respond(400, {"error": "invalid Content-Length header"})
+            return
         body = self.rfile.read(content_length) or b"{}"
 
         # Build headers dict (lowercase keys), handle HTTPMessage multi-value
@@ -504,11 +518,23 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
     def _respond(self, status: int, body: dict) -> None:
         body_bytes = json.dumps(body).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("X-Webhook-ID", str(uuid.uuid4())[:12])
-        self.end_headers()
-        self.wfile.write(body_bytes)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            # Every response was sent without this header. HTTP/1.0 defaults
+            # to close-on-finish so a direct client framed the body by EOF and
+            # nothing looked wrong; a load balancer or proxy that keeps the
+            # connection alive has to guess where one webhook reply ends and
+            # the next begins, and reads a status line as body bytes.
+            self.send_header("Content-Length", str(len(body_bytes)))
+            self.send_header("X-Webhook-ID", str(uuid.uuid4())[:12])
+            self.end_headers()
+            self.wfile.write(body_bytes)
+        except (BrokenPipeError, ConnectionResetError):
+            # The sender gave up. Nothing to report and nothing to retry: the
+            # idempotency guard already recorded the attempt, so a provider
+            # retry is deduplicated rather than double-processed.
+            self.close_connection = True
 
 
 # ─── CLI entrypoint ───────────────────────────────────────────────────────────
